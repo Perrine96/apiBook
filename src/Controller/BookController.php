@@ -15,6 +15,9 @@ use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
 use App\Repository\AuthorRepository;
 use Symfony\Component\Serializer\Normalizer\AbstractNormalizer;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
+use Symfony\Contracts\Cache\TagAwareCacheInterface;
+use Symfony\Contracts\Cache\ItemInterface;
 
 /**
  * Contrôleur pour gérer les opérations CRUD sur les livres
@@ -34,9 +37,18 @@ final class BookController extends AbstractController
      * @return JsonResponse Liste de tous les livres au format JSON
      */
     #[Route('/api/books', name: 'book', methods: ['GET'])]
-    public function getBookList(BookRepository $bookRepository, SerializerInterface $serializer): JsonResponse
+    public function getBookList(BookRepository $bookRepository, SerializerInterface $serializer, Request $request, TagAwareCacheInterface $cache): JsonResponse
     {
-        $bookList = $bookRepository->findAll();
+        $page = max(1, (int) $request->query->get('page', 1));
+        $limit = max(1, min(50, (int) $request->query->get('limit', 3)));
+        
+        $idCache = "getBookList-" . $page . "-" . $limit;
+        $bookList = $cache->get($idCache, function (ItemInterface $item) use ($bookRepository, $page, $limit) {
+            $item->tag('booksCache');
+            $offset = ($page - 1) * $limit;
+            return $bookRepository->findBy([], ['id' => 'ASC'], $limit, $offset);
+        });
+
         $jsonBookList = $serializer->serialize($bookList, 'json', ['groups' => 'getBooks']); 
         return new JsonResponse($jsonBookList, Response::HTTP_OK, [], true);
     }
@@ -58,7 +70,9 @@ final class BookController extends AbstractController
             $jsonBook = $serializer->serialize($book, 'json', ['groups' => 'getBooks']); 
             return new JsonResponse($jsonBook, Response::HTTP_OK, [], true);
         }
-        return new JsonResponse(null, Response::HTTP_NOT_FOUND);
+        
+        // Lever une exception HTTP au lieu de retourner une réponse vide
+        throw new \Symfony\Component\HttpKernel\Exception\NotFoundHttpException("Livre avec l'ID $id non trouvé");
     }
 
     /**
@@ -71,7 +85,9 @@ final class BookController extends AbstractController
      * @return JsonResponse Réponse 204 si succès
      */
     #[Route('/api/books/{id}', name: 'deleteBook', methods: ['DELETE'])]
-    public function deleteBook(Book $book, EntityManagerInterface $em): JsonResponse {
+    #[IsGranted('ROLE_ADMIN', message: 'Vous n\'avez pas les permissions pour supprimer un livre')]
+    public function deleteBook(Book $book, EntityManagerInterface $em, TagAwareCacheInterface $cache): JsonResponse {
+        $cache->invalidateTags(['booksCache']);
         $em->remove($book);
         $em->flush();
         return new JsonResponse(null, Response::HTTP_NO_CONTENT);
@@ -94,7 +110,8 @@ final class BookController extends AbstractController
      * @return JsonResponse Livre créé ou erreurs de validation
      */
     #[Route('/api/books', name: 'createBook', methods: ['POST'])]
-    public function createBook(Request $request, SerializerInterface $serializer, EntityManagerInterface $em, UrlGeneratorInterface $urlGenerator, ValidatorInterface $validator): JsonResponse {
+    #[IsGranted('ROLE_ADMIN', message: 'Vous n\'avez pas les permissions pour créer un livre')]
+    public function createBook(Request $request, SerializerInterface $serializer, EntityManagerInterface $em, UrlGeneratorInterface $urlGenerator, ValidatorInterface $validator, TagAwareCacheInterface $cache): JsonResponse {
         try {
             $data = json_decode($request->getContent(), true);
             
@@ -133,6 +150,9 @@ final class BookController extends AbstractController
             $em->persist($book);
             $em->flush();
             
+            // Invalider le cache des livres
+            $cache->invalidateTags(['booksCache']);
+            
             $jsonBook = $serializer->serialize($book, 'json', ['groups' => 'getBooks']);
             $location = $urlGenerator->generate('detailBook', ['id' => $book->getId()], UrlGeneratorInterface::ABSOLUTE_URL);
             
@@ -158,13 +178,35 @@ final class BookController extends AbstractController
      * @return JsonResponse Réponse 204 si succès
      */
     #[Route('/api/books/{id}', name: 'updateBook', methods: ['PUT'])]
-    public function updateBook(Book $currentBook, Request $request, SerializerInterface $serializer, EntityManagerInterface $em, AuthorRepository $authorRepository): JsonResponse {
+    #[IsGranted('ROLE_ADMIN', message: 'Vous n\'avez pas les permissions pour modifier un livre')]
+    public function updateBook(Book $currentBook, Request $request, SerializerInterface $serializer, EntityManagerInterface $em, AuthorRepository $authorRepository, TagAwareCacheInterface $cache): JsonResponse {
         $updatedBook = $serializer->deserialize($request->getContent(), Book::class, 'json', [AbstractNormalizer::OBJECT_TO_POPULATE => $currentBook]);
         $content = $request->toArray();
         $idAuthor = $content['idAuthor'] ?? -1;
         $updatedBook->setAuthor($authorRepository->find($idAuthor));
         $em->persist($updatedBook);
         $em->flush();
+        
+        // Invalider le cache des livres
+        $cache->invalidateTags(['booksCache']);
+        
         return new JsonResponse(null, Response::HTTP_NO_CONTENT);
+    }
+
+    /**
+     * Vide le cache des livres
+     * 
+     * Route: POST /api/books/clear-cache
+     * 
+     * @param TagAwareCacheInterface $cache Service de cache
+     * @return JsonResponse Confirmation de suppression du cache
+     */
+    #[Route('/api/books/clear-cache', name: 'clear_books_cache', methods: ['POST'])]
+    #[IsGranted('ROLE_ADMIN', message: 'Vous n\'avez pas les permissions pour vider le cache')]
+    public function clearBooksCache(TagAwareCacheInterface $cache): JsonResponse
+    {
+        $cache->invalidateTags(['booksCache']);
+        
+        return new JsonResponse(['message' => 'Cache des livres vidé avec succès'], Response::HTTP_OK);
     }
 }

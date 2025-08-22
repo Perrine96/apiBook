@@ -25,10 +25,12 @@ class Book
 
     #[ORM\Column(type: Types::TEXT, nullable: true)]
     #[Groups(['getBooks'])]
+    #[Assert\Length(max: 10000, maxMessage: 'La description ne peut pas dépasser {{ limit }} caractères')]
     private ?string $coverText = null;
 
     #[ORM\ManyToOne(inversedBy: 'Books', cascade: ['persist'])]
     #[Groups(['getBooks'])]
+    #[Assert\NotNull(message: 'Un auteur doit être associé au livre')]
     private ?Author $author = null;
 
     public function getId(): ?int

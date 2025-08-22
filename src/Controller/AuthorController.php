@@ -13,6 +13,9 @@ use App\Entity\Author;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
+use Symfony\Contracts\Cache\TagAwareCacheInterface;
+use Symfony\Contracts\Cache\ItemInterface;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
 
 /**
  * Contrôleur pour gérer les opérations CRUD sur les auteurs
@@ -23,18 +26,29 @@ use Symfony\Component\Validator\Validator\ValidatorInterface;
 final class AuthorController extends AbstractController
 {
     /**
-     * Récupère tous les auteurs
+     * Récupère tous les auteurs avec pagination et cache
      * 
      * Route: GET /api/authors
      * 
      * @param AuthorRepository $authorRepository Repository pour accéder aux données des auteurs
      * @param SerializerInterface $serializer Service de sérialisation pour convertir en JSON
+     * @param Request $request Requête HTTP pour récupérer les paramètres de pagination
+     * @param TagAwareCacheInterface $cache Service de cache
      * @return JsonResponse Liste de tous les auteurs au format JSON
      */
     #[Route('/api/authors', name: 'authors_list', methods: ['GET'])]
-    public function getAllAuthors(AuthorRepository $authorRepository, SerializerInterface $serializer): JsonResponse
+    public function getAllAuthors(AuthorRepository $authorRepository, SerializerInterface $serializer, Request $request, TagAwareCacheInterface $cache): JsonResponse
     {
-        $authorList = $authorRepository->findAll();
+        $page = max(1, (int) $request->query->get('page', 1));
+        $limit = max(1, min(50, (int) $request->query->get('limit', 3)));
+        
+        $idCache = "getAllAuthors-" . $page . "-" . $limit;
+        $authorList = $cache->get($idCache, function (ItemInterface $item) use ($authorRepository, $page, $limit) {
+            $item->tag('authorsCache');
+            $offset = ($page - 1) * $limit;
+            return $authorRepository->findBy([], ['id' => 'ASC'], $limit, $offset);
+        });
+        
         $jsonAuthorList = $serializer->serialize($authorList, 'json', ['groups' => 'getBooks']);
         return new JsonResponse($jsonAuthorList, Response::HTTP_OK, [], true);
     }
@@ -57,7 +71,9 @@ final class AuthorController extends AbstractController
             $jsonAuthor = $serializer->serialize($author, 'json', ['groups' => 'getBooks']);
             return new JsonResponse($jsonAuthor, Response::HTTP_OK, [], true);
         }
-        return new JsonResponse(null, Response::HTTP_NOT_FOUND);
+        
+        // Lever une exception HTTP au lieu de retourner une réponse vide
+        throw new \Symfony\Component\HttpKernel\Exception\NotFoundHttpException("Auteur avec l'ID $id non trouvé");
     }
 
     /**
@@ -79,7 +95,7 @@ final class AuthorController extends AbstractController
      * @return JsonResponse Auteur créé ou erreurs de validation
      */
     #[Route('/api/authors', name: 'create_author', methods: ['POST'])]
-    public function createAuthor(Request $request, SerializerInterface $serializer, EntityManagerInterface $em, UrlGeneratorInterface $urlGenerator, ValidatorInterface $validator): JsonResponse
+    public function createAuthor(Request $request, SerializerInterface $serializer, EntityManagerInterface $em, UrlGeneratorInterface $urlGenerator, ValidatorInterface $validator, TagAwareCacheInterface $cache): JsonResponse
     {
         try {
             // Désérialiser les données JSON en objet Author
@@ -98,6 +114,9 @@ final class AuthorController extends AbstractController
             // Persister l'auteur en base de données
             $em->persist($author);
             $em->flush();
+            
+            // Invalider le cache des auteurs
+            $cache->invalidateTags(['authorsCache']);
             
             // Sérialiser l'auteur créé pour la réponse
             $jsonAuthor = $serializer->serialize($author, 'json', ['groups' => 'getBooks']);
@@ -127,7 +146,7 @@ final class AuthorController extends AbstractController
      * @return JsonResponse Réponse 204 si succès ou erreurs de validation
      */
     #[Route('/api/authors/{id}', name: 'update_author', methods: ['PUT'])]
-    public function updateAuthor(Author $currentAuthor, Request $request, SerializerInterface $serializer, EntityManagerInterface $em, ValidatorInterface $validator): JsonResponse
+    public function updateAuthor(Author $currentAuthor, Request $request, SerializerInterface $serializer, EntityManagerInterface $em, ValidatorInterface $validator, TagAwareCacheInterface $cache): JsonResponse
     {
         try {
             // Mettre à jour l'auteur existant avec les nouvelles données
@@ -152,6 +171,9 @@ final class AuthorController extends AbstractController
             $em->persist($updatedAuthor);
             $em->flush();
             
+            // Invalider le cache des auteurs
+            $cache->invalidateTags(['authorsCache']);
+            
             return new JsonResponse(null, Response::HTTP_NO_CONTENT);
         } catch (\Exception $e) {
             return new JsonResponse(['error' => 'Erreur lors de la mise à jour de l\'auteur: ' . $e->getMessage()], Response::HTTP_BAD_REQUEST);
@@ -171,12 +193,32 @@ final class AuthorController extends AbstractController
      * @return JsonResponse Réponse 204 si succès
      */
     #[Route('/api/authors/{id}', name: 'delete_author', methods: ['DELETE'])]
-    public function deleteAuthor(Author $author, EntityManagerInterface $em): JsonResponse
+    public function deleteAuthor(Author $author, EntityManagerInterface $em, TagAwareCacheInterface $cache): JsonResponse
     {
         // Supprimer l'auteur (les livres seront supprimés automatiquement grâce au cascade: ['remove'])
         $em->remove($author);
         $em->flush();
         
+        // Invalider le cache des auteurs et des livres
+        $cache->invalidateTags(['authorsCache', 'booksCache']);
+        
         return new JsonResponse(null, Response::HTTP_NO_CONTENT);
+    }
+
+    /**
+     * Vide le cache des auteurs
+     * 
+     * Route: POST /api/authors/clear-cache
+     * 
+     * @param TagAwareCacheInterface $cache Service de cache
+     * @return JsonResponse Confirmation de suppression du cache
+     */
+    #[Route('/api/authors/clear-cache', name: 'clear_authors_cache', methods: ['POST'])]
+    #[IsGranted('ROLE_ADMIN', message: 'Vous n\'avez pas les permissions pour vider le cache')]
+    public function clearAuthorsCache(TagAwareCacheInterface $cache): JsonResponse
+    {
+        $cache->invalidateTags(['authorsCache']);
+        
+        return new JsonResponse(['message' => 'Cache des auteurs vidé avec succès'], Response::HTTP_OK);
     }
 }
